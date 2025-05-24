@@ -1,10 +1,4 @@
-// live_sniffer.go – Step 4.3
-// ===========================================
-// • Live dashboard: PPS/BPS gauges, protocol bar chart, top-source table
-// • -n / -i interface selection
-// • -f BPF filter (quotes auto-trimmed + keyword expansion)
-// • UI heartbeat every 500 ms so q/p keys always respond
-// • q quit   p pause/resume
+// live_sniffer.go 
 package main
 
 import (
@@ -25,7 +19,7 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-/* ─────────────── data types ─────────────── */
+
 
 type packetInfo struct {
 	size  int
@@ -44,7 +38,7 @@ type statsSnapshot struct {
 	top                  []kv
 }
 
-/* ─────────────── packet helper ─────────────── */
+
 
 func analyse(pkt gopacket.Packet) (proto, src string) {
 	switch {
@@ -68,7 +62,7 @@ func analyse(pkt gopacket.Packet) (proto, src string) {
 	return
 }
 
-/* ─────────────── main ─────────────── */
+
 
 func main() {
 	list   := flag.Bool("list", false, "list interfaces and exit")
@@ -104,7 +98,7 @@ func main() {
 	go capture(handle, pktCh)
 	go aggregate(pktCh, statCh)
 
-	/* UI init */
+
 	if err := ui.Init(); err != nil { log.Fatalf("termui init: %v", err) }
 	defer ui.Close()
 
@@ -132,7 +126,7 @@ func main() {
 	sigs   := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt)
 	uiEvents := ui.PollEvents()
-	uiTick   := time.NewTicker(500 * time.Millisecond) // heartbeat
+	uiTick   := time.NewTicker(500 * time.Millisecond) 
 	defer uiTick.Stop()
 
 	for {
@@ -161,7 +155,7 @@ func main() {
 	}
 }
 
-/* ─────────────── UI helper ─────────────── */
+
 
 func updateUI(gPPS, gBPS *widgets.Gauge, bar *widgets.BarChart, table *widgets.Table, s statsSnapshot) {
 	gPPS.Label   = fmt.Sprintf("%d pps", s.pps)
@@ -180,7 +174,7 @@ func updateUI(gPPS, gBPS *widgets.Gauge, bar *widgets.BarChart, table *widgets.T
 	table.Rows = rows
 }
 
-/* ─────────────── goroutines ─────────────── */
+
 
 func capture(h *pcap.Handle, out chan<- packetInfo) {
 	src := gopacket.NewPacketSource(h, h.LinkType())
@@ -216,7 +210,7 @@ func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
 	}
 }
 
-/* ─────────────── utils ─────────────── */
+
 
 func listIfaces() {
 	devs, _ := pcap.FindAllDevs()
@@ -248,7 +242,7 @@ func scale(val, max uint64) uint64 {
 func expandSimpleFilter(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "icmp":
-		return "icmp"             // IPv4 ICMP; IPv6 pings show as icmp6 anyway
+		return "icmp"             
 	case "tcp":
 		return "tcp"
 	case "udp":
