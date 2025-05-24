@@ -1,3 +1,7 @@
+// live_sniffer.go – Step 3.2  (complete file, compiles)
+// ======================================================
+// Adds live top‑talker table (top source IPs per second).
+// Fixed previous truncation; full file below.
 
 package main
 
@@ -5,7 +9,6 @@ import (
     "flag"
     "fmt"
     "log"
-    "net"
     "os"
     "os/signal"
     "sort"
@@ -24,8 +27,13 @@ import (
 
 type packetInfo struct {
     size  int
-    proto string // TCP / UDP / ICMP / Other
-    src   string 
+    proto string
+    src   string
+}
+
+type kv struct {
+    key string
+    val uint64
 }
 
 type statsSnapshot struct {
@@ -35,17 +43,11 @@ type statsSnapshot struct {
     udp  uint64
     icmp uint64
     oth  uint64
-    top  []kv 
+    top  []kv
 }
 
-type kv struct{
-    key string
-    val uint64
-}
-
-
-func analyse(pkt gopacket.Packet) (proto string, src string) {
-
+// ── helper: analyse packet ───────────────────────────────
+func analyse(pkt gopacket.Packet) (proto, src string) {
     switch {
     case pkt.Layer(layers.LayerTypeTCP) != nil:
         proto = "TCP"
@@ -56,18 +58,17 @@ func analyse(pkt gopacket.Packet) (proto string, src string) {
     default:
         proto = "Other"
     }
-
     if ip4 := pkt.Layer(layers.LayerTypeIPv4); ip4 != nil {
         src = ip4.(*layers.IPv4).SrcIP.String()
     } else if ip6 := pkt.Layer(layers.LayerTypeIPv6); ip6 != nil {
         src = ip6.(*layers.IPv6).SrcIP.String()
     } else {
-        src = "<non‑IP>"
+        src = "<non-IP>"
     }
     return
 }
 
-
+// ── main ──────────────────────────────────────────────────
 func main() {
     list := flag.Bool("list", false, "list interfaces and exit")
     idx := flag.Int("n", 0, "index from -list (1-based)")
@@ -80,21 +81,19 @@ func main() {
     }
     dev := resolveDevice(*iface, *idx)
 
-    h, err := pcap.OpenLive(dev, 2000, true, pcap.BlockForever)
+    handle, err := pcap.OpenLive(dev, 2000, true, pcap.BlockForever)
     if err != nil {
         log.Fatalf("pcap open error on %s: %v", dev, err)
     }
-    defer h.Close()
+    defer handle.Close()
 
     fmt.Printf("[*] Capturing on %s – q=quit, p=pause…\n", dev)
 
-
-    pktCh := make(chan packetInfo, 2000)
+    pktCh := make(chan packetInfo, 4000)
     statCh := make(chan statsSnapshot, 5)
 
-    go capture(h, pktCh)
+    go capture(handle, pktCh)
     go aggregate(pktCh, statCh)
-
 
     if err := ui.Init(); err != nil {
         log.Fatalf("termui init: %v", err)
@@ -121,10 +120,9 @@ func main() {
 
     ui.Render(gaugePPS, gaugeBPS, bar, table)
 
+    paused := false
     sigs := make(chan os.Signal, 1)
     signal.Notify(sigs, os.Interrupt)
-
-    paused := false
     events := ui.PollEvents()
 
     for {
@@ -142,26 +140,30 @@ func main() {
             if paused {
                 continue
             }
-      
-            gaugePPS.Label = fmt.Sprintf("%d pps", s.pps)
-            gaugePPS.Percent = int(scale(s.pps, 10000))
-            kb := s.bps / 1024
-            gaugeBPS.Label = fmt.Sprintf("%d KB/s", kb)
-            gaugeBPS.Percent = int(scale(kb, 100000))
-         
-            bar.Data = []float64{float64(s.tcp), float64(s.udp), float64(s.icmp), float64(s.oth)}
-         
-            rows := [][]string{{"IP", "pps"}}
-            for _, kv := range s.top {
-                rows = append(rows, []string{kv.key, fmt.Sprintf("%d", kv.val)})
-            }
-            table.Rows = rows
+            updateUI(gaugePPS, gaugeBPS, bar, table, s)
             ui.Render(gaugePPS, gaugeBPS, bar, table)
         }
     }
 }
 
+// ── UI helper ─────────────────────────────────────────────
+func updateUI(gPPS, gBPS *widgets.Gauge, bar *widgets.BarChart, table *widgets.Table, s statsSnapshot) {
+    gPPS.Label = fmt.Sprintf("%d pps", s.pps)
+    gPPS.Percent = int(scale(s.pps, 10000))
+    kb := s.bps / 1024
+    gBPS.Label = fmt.Sprintf("%d KB/s", kb)
+    gBPS.Percent = int(scale(kb, 100000))
 
+    bar.Data = []float64{float64(s.tcp), float64(s.udp), float64(s.icmp), float64(s.oth)}
+
+    rows := [][]string{{"IP", "pps"}}
+    for _, x := range s.top {
+        rows = append(rows, []string{x.key, fmt.Sprintf("%d", x.val)})
+    }
+    table.Rows = rows
+}
+
+// ── goroutines ───────────────────────────────────────────
 func capture(h *pcap.Handle, out chan<- packetInfo) {
     src := gopacket.NewPacketSource(h, h.LinkType())
     for p := range src.Packets() {
@@ -171,11 +173,9 @@ func capture(h *pcap.Handle, out chan<- packetInfo) {
 }
 
 func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
-    var pps, bps uint64
-    var tcp, udp, icmp, oth uint64
+    var pps, bps, tcp, udp, icmp, oth uint64
     topMap := make(map[string]uint64)
-
-    ticker := time.NewTicker(time.Second)
+    tick := time.NewTicker(time.Second)
     for {
         select {
         case p := <-in:
@@ -192,24 +192,19 @@ func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
                 oth++
             }
             topMap[p.src]++
-        case <-ticker.C:
-            out <- statsSnapshot{
-                pps: pps, bps: bps,
-                tcp: tcp, udp: udp, icmp: icmp, oth: oth,
-                top: topN(topMap, 5),
-            }
-            // reset
+        case <-tick.C:
+            out <- statsSnapshot{pps: pps, bps: bps, tcp: tcp, udp: udp, icmp: icmp, oth: oth, top: topN(topMap, 5)}
             pps, bps, tcp, udp, icmp, oth = 0, 0, 0, 0, 0, 0
             topMap = make(map[string]uint64)
         }
     }
 }
 
-
+// ── helpers ───────────────────────────────────────────────
 func listIfaces() {
-    ifs, _ := pcap.FindAllDevs()
+    devs, _ := pcap.FindAllDevs()
     fmt.Println("Capture interfaces:")
-    for i, d := range ifs {
+    for i, d := range devs {
         desc := d.Description
         if desc == "" {
             desc = d.Name
@@ -250,7 +245,7 @@ func topN(m map[string]uint64, n int) []kv {
     }
     sort.Slice(arr, func(i, j int) bool { return arr[i].val > arr[j].val })
     if len(arr) > n {
-        return arr[:n]
+        arr = arr[:n]
     }
     return arr
 }
