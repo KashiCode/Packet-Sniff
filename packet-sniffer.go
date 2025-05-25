@@ -1,4 +1,19 @@
-
+// live_sniffer.go – Full-featured TUI + CSV/LP + Rotation + Histogram + Dual Tables + Dynamic Resize
+// ================================================================================================
+// Flags:
+//   -list              list interfaces and exit
+//   -n <idx>           capture by index (1-based from -list)
+//   -i <device>        capture by exact \\Device\\NPF_{GUID}
+//   -f <expr>          BPF filter (quotes trimmed; icmp|tcp|udp shortcuts)
+//   -w <file.pcap>     base name for PCAP dump
+//   -rotate-size N     rotate PCAP every N MB (0=off)
+//   -csv <file.csv>    write per-second stats to CSV
+//   -lp <file.lp>      write per-second stats in Influx line-protocol
+//
+// TUI Keys:
+//   p ↔ pause/resume    q or Ctrl-C → quit
+//
+// Layout auto‐scales to your full terminal size and reflows on resize.
 package main
 
 import (
@@ -9,6 +24,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,9 +42,10 @@ import (
 
 
 type packetInfo struct {
-	size      int
-	proto     string
-	src, dest string
+	size  int
+	proto string
+	src   string
+	dst   string
 }
 
 type kv struct{ key string; val uint64 }
@@ -36,6 +53,7 @@ type kv struct{ key string; val uint64 }
 type statsSnapshot struct {
 	pps, bps            uint64
 	tcp, udp, icmp, oth uint64
+	histogram           [4]uint64
 	topSrc, topDst      []kv
 }
 
@@ -47,7 +65,8 @@ func analyse(pkt gopacket.Packet) (proto, src, dst string) {
 		proto = "TCP"
 	case pkt.Layer(layers.LayerTypeUDP) != nil:
 		proto = "UDP"
-	case pkt.Layer(layers.LayerTypeICMPv4) != nil || pkt.Layer(layers.LayerTypeICMPv6) != nil:
+	case pkt.Layer(layers.LayerTypeICMPv4) != nil ||
+		pkt.Layer(layers.LayerTypeICMPv6) != nil:
 		proto = "ICMP"
 	default:
 		proto = "Other"
@@ -56,8 +75,7 @@ func analyse(pkt gopacket.Packet) (proto, src, dst string) {
 		h := ip4.(*layers.IPv4)
 		src, dst = h.SrcIP.String(), h.DstIP.String()
 	} else if ip6 := pkt.Layer(layers.LayerTypeIPv6); ip6 != nil {
-		h := ip6.(*layers.IPv6)
-		src, dst = h.SrcIP.String(), h.DstIP.String()
+		h := ip6.(*layers.IPv6); src, dst = h.SrcIP.String(), h.DstIP.String()
 	} else {
 		src, dst = "<non-IP>", "<non-IP>"
 	}
@@ -68,33 +86,31 @@ func analyse(pkt gopacket.Packet) (proto, src, dst string) {
 
 func main() {
 
-	list  := flag.Bool("list", false, "list interfaces and exit")
-	idx   := flag.Int("n", 0, "index from -list (1-based)")
-	iface := flag.String("i", "", "exact device string (overrides -n)")
-	filter := flag.String("f", "", "BPF filter, e.g. 'tcp port 443'")
-	outPC := flag.String("w", "", "write raw packets to <file.pcap>")
-	outCSV := flag.String("csv", "", "write per-second stats to <file.csv>")
-	outLP := flag.String("lp", "", "write per-second stats in Influx line-protocol to <file.lp>")
+	list      := flag.Bool("list", false, "list interfaces and exit")
+	idx       := flag.Int("n", 0, "index from -list (1-based)")
+	iface     := flag.String("i", "", "exact device string (overrides -n)")
+	filter    := flag.String("f", "", "BPF filter, e.g. 'tcp port 443'")
+	outPC     := flag.String("w", "", "base name for PCAP dump")
+	rotateMB  := flag.Int("rotate-size", 0, "rotate PCAP every N MB (0=off)")
+	outCSV    := flag.String("csv", "", "write stats to <file.csv>")
+	outLP     := flag.String("lp", "", "write stats in LP to <file.lp>")
 	flag.Parse()
 	*filter = expandSimpleFilter(strings.Trim(*filter, "\"'"))
 
-	
 	if *list {
 		listIfaces()
 		return
 	}
 
-
+	
 	dev := resolveDevice(*iface, *idx)
-
-
 	handle, err := pcap.OpenLive(dev, 2000, true, pcap.BlockForever)
 	if err != nil {
-		log.Fatalf("pcap open error on %s: %v", dev, err)
+		log.Fatalf("pcap open %s: %v", dev, err)
 	}
 	defer handle.Close()
 
-
+	
 	if *filter != "" {
 		if err := handle.SetBPFFilter(*filter); err != nil {
 			log.Fatalf("invalid BPF filter: %v", err)
@@ -102,32 +118,30 @@ func main() {
 		fmt.Printf("[+] BPF filter applied: %s\n", *filter)
 	}
 
-	var dumper *pcapgo.Writer
-	var dumpFile *os.File
+	
+	rotateBytes := int64(*rotateMB) * 1024 * 1024
 	if *outPC != "" {
-		f, err := os.Create(*outPC)
-		if err != nil {
-			log.Fatalf("pcap writer: %v", err)
+		if rotateBytes > 0 {
+			fmt.Printf("[+] Rotating PCAP every %d MB, base=%s\n", *rotateMB, *outPC)
+		} else {
+			fmt.Printf("[+] Writing PCAP to %s\n", *outPC)
 		}
-		dumpFile = f
-		dumper = pcapgo.NewWriter(f)
-		dumper.WriteFileHeader(2000, handle.LinkType())
-		fmt.Printf("[+] Writing packets to %s …\n", *outPC)
 	}
 
-
+	
 	var csvWriter *csv.Writer
 	var csvFile *os.File
 	if *outCSV != "" {
 		f, err := os.Create(*outCSV)
 		if err != nil {
-			log.Fatalf("csv writer: %v", err)
+			log.Fatalf("csv create: %v", err)
 		}
 		csvFile = f
+		defer csvFile.Close() 
 		csvWriter = csv.NewWriter(f)
 		csvWriter.Write([]string{"time","pps","bps","tcp","udp","icmp","other"})
 		csvWriter.Flush()
-		fmt.Printf("[+] Writing stats to %s …\n", *outCSV)
+		fmt.Printf("[+] Writing CSV to %s\n", *outCSV)
 	}
 
 	
@@ -136,82 +150,73 @@ func main() {
 	if *outLP != "" {
 		f, err := os.Create(*outLP)
 		if err != nil {
-			log.Fatalf("line-protocol writer: %v", err)
+			log.Fatalf("lp create: %v", err)
 		}
 		lpFile = f
+		defer lpFile.Close() 
 		lpWriter = bufio.NewWriter(f)
-		fmt.Printf("[+] Writing LP to %s …\n", *outLP)
+		fmt.Printf("[+] Writing LP to %s\n", *outLP)
 	}
 
-	fmt.Printf("[*] Capturing on %s  –  q quit | p pause | t toggle view …\n", dev)
-
-
+	
 	pktCh := make(chan packetInfo, 4096)
 	statCh := make(chan statsSnapshot, 8)
-	go capture(handle, dumper, pktCh)
+	go capture(handle, *outPC, rotateBytes, handle.LinkType(), pktCh)
 	go aggregate(pktCh, statCh)
 
-
+	
 	if err := ui.Init(); err != nil {
 		log.Fatalf("termui init: %v", err)
 	}
 	defer ui.Close()
 
 
-	gPPS := widgets.NewGauge(); gPPS.Title="Packets / sec"; gPPS.SetRect(0,0,60,3)
-	gBPS := widgets.NewGauge(); gBPS.Title="Bytes / sec";   gBPS.SetRect(0,3,60,6)
-
-	bar := widgets.NewBarChart()
-	bar.Title="Protocol mix (pps)"
-	bar.Labels=[]string{"TCP","UDP","ICMP","Other"}
-	bar.SetRect(0,6,60,14)
-
-	table := widgets.NewTable()
-	table.Rows = [][]string{{"IP","pps"}}
-	table.SetRect(0,14,60,23)
-
+	gPPS := widgets.NewGauge()
+	gBPS := widgets.NewGauge()
+	bar  := widgets.NewBarChart()
+	hist := widgets.NewBarChart()
+	srcT := widgets.NewTable()
+	dstT := widgets.NewTable()
 	help := widgets.NewParagraph()
-	help.Text="[t] toggle view   |   [p] pause/resume   |   [q] quit"
-	help.Border=false
-	help.TextStyle=ui.NewStyle(ui.ColorYellow)
-	help.SetRect(0,23,60,25)
+	help.Text = "[p] pause/resume   |   [q] quit"
+	help.Border = false
+	help.TextStyle = ui.NewStyle(ui.ColorYellow)
 
-	ui.Render(gPPS, gBPS, bar, table, help)
+	
+	w, h := ui.TerminalDimensions()
+	layout(w, h, gPPS, gBPS, bar, hist, srcT, dstT, help)
+	ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
 
-
-	uiCh := make(chan ui.Event,20)
-	go func(){ for e := range ui.PollEvents() { uiCh<-e } }()
-	heartbeat := time.NewTicker(500*time.Millisecond)
+	
+	uiEvents := make(chan ui.Event, 20)
+	go func() { for e := range ui.PollEvents() { uiEvents <- e } }()
+	heartbeat := time.NewTicker(500 * time.Millisecond)
 	defer heartbeat.Stop()
 
 	paused := false
-	viewMode := 0 
-	sigsCh := make(chan os.Signal,1)
-	signal.Notify(sigsCh, os.Interrupt)
+	sigCh  := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
 
 	for {
 		select {
-		case <-sigsCh:
-			if dumpFile!=nil { dumpFile.Close() }
-			if csvFile!=nil  { csvFile.Close() }
-			if lpFile!=nil   { lpFile.Close() }
+		case <-sigCh:
 			return
 
-		case e := <-uiCh:
+		case e := <-uiEvents:
 			switch e.ID {
 			case "q","Q","<C-c>":
-				if dumpFile!=nil { dumpFile.Close() }
-				if csvFile!=nil  { csvFile.Close() }
-				if lpFile!=nil   { lpFile.Close() }
 				return
 			case "p","P":
 				paused = !paused
-			case "t","T":
-				viewMode = (viewMode+1)%3
+			case "<Resize>":
+				d := e.Payload.(ui.Resize)
+				layout(d.Width, d.Height, gPPS, gBPS, bar, hist, srcT, dstT, help)
+				ui.Clear()
+				ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
 			}
 
 		case snap := <-statCh:
-		
+			
 			if csvWriter != nil {
 				csvWriter.Write([]string{
 					time.Now().UTC().Format(time.RFC3339),
@@ -224,25 +229,23 @@ func main() {
 				})
 				csvWriter.Flush()
 			}
-
-		
+			
 			if lpWriter != nil {
 				ts := time.Now().UTC().UnixNano()
 				lpWriter.WriteString(
 					fmt.Sprintf("live_sniffer pps=%d,bps=%d,tcp=%d,udp=%d,icmp=%d,other=%d %d\n",
-						snap.pps, snap.bps, snap.tcp, snap.udp, snap.icmp, snap.oth, ts))
+						snap.pps,snap.bps,snap.tcp,snap.udp,snap.icmp,snap.oth,ts))
 				lpWriter.Flush()
 			}
-
 			if paused {
 				continue
 			}
-			updateUI(gPPS, gBPS, bar, table, help, snap, viewMode)
-			ui.Render(gPPS, gBPS, bar, table, help)
+			updateWidgets(snap, gPPS, gBPS, bar, hist, srcT, dstT)
+			ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
 
 		case <-heartbeat.C:
 			if !paused {
-				ui.Render(gPPS, gBPS, bar, table, help)
+				ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
 			}
 		}
 	}
@@ -250,133 +253,237 @@ func main() {
 
 
 
-func updateUI(
+func layout(
+	w, h int,
 	gPPS, gBPS *widgets.Gauge,
-	bar *widgets.BarChart,
-	table *widgets.Table,
+	bar, hist *widgets.BarChart,
+	srcT, dstT *widgets.Table,
 	help *widgets.Paragraph,
+) {
+	
+	gPPS.SetRect(0, 0, w, 3)
+	gPPS.Title = "Packets / sec"
+	gBPS.SetRect(0, 3, w, 6)
+	gBPS.Title = "Bytes / sec"
+
+	
+	bar.SetRect(0, 6, w, 12)
+	bar.Title  = "Protocol mix (pps)"
+	bar.Labels = []string{"TCP","UDP","ICMP","Other"}
+
+	
+	hist.SetRect(0, 12, w, 16)
+	hist.Title  = "Packet size histogram"
+	hist.Labels = []string{"<=64B","65–512B","513–1500B",">1500B"}
+
+	
+	srcT.SetRect(0, 16, w/2, h-2)
+	srcT.Title = "Top source IPs (pps)"
+	srcT.Rows  = [][]string{{"IP","pps"}}
+
+	dstT.SetRect(w/2, 16, w, h-2)
+	dstT.Title = "Top destination IPs (pps)"
+	dstT.Rows  = [][]string{{"IP","pps"}}
+
+	
+	help.SetRect(0, h-2, w, h)
+}
+
+
+
+func updateWidgets(
 	s statsSnapshot,
-	mode int,
+	gPPS, gBPS *widgets.Gauge,
+	bar, hist *widgets.BarChart,
+	srcT, dstT *widgets.Table,
 ) {
 	gPPS.Label, gPPS.Percent = fmt.Sprintf("%d pps", s.pps), int(scale(s.pps,10000))
-	kb := s.bps/1024
+	kb := s.bps / 1024
 	gBPS.Label, gBPS.Percent = fmt.Sprintf("%d KB/s", kb), int(scale(kb,100000))
-	bar.Data = []float64{float64(s.tcp),float64(s.udp),float64(s.icmp),float64(s.oth)}
 
-	switch mode {
-	case 0:
-		table.Title="[S]ource IPs (pps)"
-		table.Rows = toRows(s.topSrc)
-	case 1:
-		table.Title="[D]estination IPs (pps)"
-		table.Rows = toRows(s.topDst)
-	case 2:
-		table.Title="[B] Src+Dst (pps)"
-		table.Rows = toRows(mergeKV(s.topSrc,s.topDst))
+	bar.Data = []float64{
+		float64(s.tcp), float64(s.udp),
+		float64(s.icmp), float64(s.oth),
 	}
+
+	hist.Data = []float64{
+		float64(s.histogram[0]),
+		float64(s.histogram[1]),
+		float64(s.histogram[2]),
+		float64(s.histogram[3]),
+	}
+
+	srcRows := [][]string{{"IP","pps"}}
+	for _, kv := range s.topSrc {
+		srcRows = append(srcRows, []string{kv.key, fmt.Sprintf("%d", kv.val)})
+	}
+	srcT.Rows = srcRows
+
+	dstRows := [][]string{{"IP","pps"}}
+	for _, kv := range s.topDst {
+		dstRows = append(dstRows, []string{kv.key, fmt.Sprintf("%d", kv.val)})
+	}
+	dstT.Rows = dstRows
 }
 
-func toRows(arr []kv) [][]string {
-	rows := [][]string{{"IP","pps"}}
-	for _, kv := range arr {
-		rows = append(rows, []string{kv.key,fmt.Sprintf("%d",kv.val)})
+
+
+func capture(
+	h *pcap.Handle,
+	outPC string,
+	rotateBytes int64,
+	linkType layers.LinkType,
+	out chan<- packetInfo,
+) {
+	var f *os.File
+	var w *pcapgo.Writer
+
+	open := func() {
+		name := outPC
+		if rotateBytes > 0 {
+			ext := filepath.Ext(outPC)
+			base := strings.TrimSuffix(outPC, ext)
+			name = fmt.Sprintf("%s_%s%s", base, time.Now().Format("20060102_150405"), ext)
+		}
+		var err error
+		f, err = os.Create(name)
+		if err != nil {
+			log.Fatalf("pcap open: %v", err)
+		}
+		w = pcapgo.NewWriter(f)
+		w.WriteFileHeader(2000, linkType)
 	}
-	return rows
-}
 
+	if outPC != "" {
+		open()
+	}
 
-
-func capture(h *pcap.Handle, dump *pcapgo.Writer, out chan<- packetInfo) {
-	src := gopacket.NewPacketSource(h,h.LinkType())
-	for pkt := range src.Packets() {
-		if dump!=nil {
-			_ = dump.WritePacket(pkt.Metadata().CaptureInfo,pkt.Data())
+	srcPackets := gopacket.NewPacketSource(h, h.LinkType())
+	for pkt := range srcPackets.Packets() {
+		if w != nil {
+			_ = w.WritePacket(pkt.Metadata().CaptureInfo, pkt.Data())
+			if rotateBytes > 0 {
+				if info, _ := f.Stat(); info.Size() >= rotateBytes {
+					f.Close()
+					open()
+				}
+			}
 		}
 		proto, s, d := analyse(pkt)
 		out <- packetInfo{len(pkt.Data()), proto, s, d}
 	}
+	if f != nil {
+		f.Close()
+	}
 }
 
+
+
 func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
-	var pps,bps,tcp,udp,icmp,oth uint64
-	srcMap := map[string]uint64{}
-	dstMap := map[string]uint64{}
+	var pps, bps, tcp, udp, icmp, oth uint64
+	bins := [4]uint64{}
+	srcMap := make(map[string]uint64)
+	dstMap := make(map[string]uint64)
 	tick := time.NewTicker(time.Second)
 
 	for {
 		select {
 		case p := <-in:
-			pps++; bps+=uint64(p.size)
+			pps++; bps += uint64(p.size)
 			switch p.proto {
 			case "TCP": tcp++
 			case "UDP": udp++
 			case "ICMP": icmp++
 			default: oth++
 			}
+			switch {
+			case p.size <= 64:
+				bins[0]++
+			case p.size <= 512:
+				bins[1]++
+			case p.size <= 1500:
+				bins[2]++
+			default:
+				bins[3]++
+			}
 			srcMap[p.src]++
-			dstMap[p.dest]++
+			dstMap[p.dst]++
 
 		case <-tick.C:
 			out <- statsSnapshot{
-				pps,bps,tcp,udp,icmp,oth,
-				topN(srcMap,5), topN(dstMap,5),
+				pps, bps, tcp, udp, icmp, oth,
+				bins,
+				topN(srcMap, 5),
+				topN(dstMap, 5),
 			}
-			pps,bps,tcp,udp,icmp,oth=0,0,0,0,0,0
-			srcMap,dstMap = map[string]uint64{}, map[string]uint64{}
+			pps, bps, tcp, udp, icmp, oth = 0, 0, 0, 0, 0, 0
+			bins = [4]uint64{}
+			srcMap = make(map[string]uint64)
+			dstMap = make(map[string]uint64)
 		}
 	}
 }
 
-/* ───────── utilities ───────── */
+
 
 func listIfaces() {
-	devs,_ := pcap.FindAllDevs()
+	devs, _ := pcap.FindAllDevs()
 	fmt.Println("Capture interfaces:")
-	for i,d := range devs {
-		desc := d.Description; if desc=="" { desc=d.Name }
+	for i, d := range devs {
+		desc := d.Description
+		if desc == "" {
+			desc = d.Name
+		}
 		fmt.Printf("%2d. %-45s (%s)\n", i+1, d.Name, desc)
 	}
 }
 
 func resolveDevice(custom string, idx int) string {
-	if custom!="" { return custom }
-	devs,_ := pcap.FindAllDevs()
-	if idx>0 && idx<=len(devs) { return devs[idx-1].Name }
-	for _,d := range devs {
-		low := strings.ToLower(d.Name+d.Description)
-		if strings.Contains(low,"loopback")||strings.HasPrefix(low,"lo") { continue }
+	if custom != "" {
+		return custom
+	}
+	devs, _ := pcap.FindAllDevs()
+	if idx > 0 && idx <= len(devs) {
+		return devs[idx-1].Name
+	}
+	for _, d := range devs {
+		low := strings.ToLower(d.Name + d.Description)
+		if strings.Contains(low, "loopback") || strings.HasPrefix(low, "lo") {
+			continue
+		}
 		return d.Name
 	}
 	return devs[0].Name
 }
 
-func scale(v,max uint64) uint64 {
-	if v>=max { return 100 }
-	return v*100/max
+func scale(val, max uint64) uint64 {
+	if val >= max {
+		return 100
+	}
+	return val * 100 / max
 }
 
 func expandSimpleFilter(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "icmp": return "icmp"
-	case "tcp":  return "tcp"
-	case "udp":  return "udp"
-	default:     return s
+	case "icmp":
+		return "icmp"
+	case "tcp":
+		return "tcp"
+	case "udp":
+		return "udp"
+	default:
+		return s
 	}
 }
 
-func topN(m map[string]uint64,n int) []kv {
-	arr := make([]kv,0,len(m))
-	for k,v := range m {
-		arr = append(arr, kv{k,v})
+func topN(m map[string]uint64, n int) []kv {
+	arr := make([]kv, 0, len(m))
+	for k, v := range m {
+		arr = append(arr, kv{k, v})
 	}
-	sort.Slice(arr, func(i,j int)bool { return arr[i].val>arr[j].val })
-	if len(arr)>n { arr = arr[:n] }
+	sort.Slice(arr, func(i, j int) bool { return arr[i].val > arr[j].val })
+	if len(arr) > n {
+		return arr[:n]
+	}
 	return arr
-}
-
-func mergeKV(a,b []kv) []kv {
-	combined := make(map[string]uint64)
-	for _,kv := range a { combined[kv.key]+=kv.val }
-	for _,kv := range b { combined[kv.key]+=kv.val }
-	return topN(combined,5)
 }
