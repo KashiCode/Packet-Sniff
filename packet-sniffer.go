@@ -1,19 +1,4 @@
-// live_sniffer.go – Full-featured TUI + CSV/LP + Rotation + Histogram + Dual Tables + Dynamic Resize
-// ================================================================================================
-// Flags:
-//   -list              list interfaces and exit
-//   -n <idx>           capture by index (1-based from -list)
-//   -i <device>        capture by exact \\Device\\NPF_{GUID}
-//   -f <expr>          BPF filter (quotes trimmed; icmp|tcp|udp shortcuts)
-//   -w <file.pcap>     base name for PCAP dump
-//   -rotate-size N     rotate PCAP every N MB (0=off)
-//   -csv <file.csv>    write per-second stats to CSV
-//   -lp <file.lp>      write per-second stats in Influx line-protocol
-//
-// TUI Keys:
-//   p ↔ pause/resume    q or Ctrl-C → quit
-//
-// Layout auto‐scales to your full terminal size and reflows on resize.
+
 package main
 
 import (
@@ -23,7 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
+	//"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -41,20 +26,48 @@ import (
 
 
 
+var (
+	fList       = flag.Bool("list", false, "list interfaces and exit")
+	fIdx        = flag.Int("n", 0, "capture by index from -list (1-based)")
+	fIface      = flag.String("i", "", "capture by full device string (overrides -n)")
+	fFilter     = flag.String("f", "", "BPF filter (icmp|tcp|udp shortcuts)")
+	fPCAP       = flag.String("w", "", "write packets to <file.pcap>")
+	fRotateMB   = flag.Int("rotate-size", 0, "rotate PCAP every N MB (0=off)")
+	fCSV        = flag.String("csv", "", "write per-second stats to <file.csv>")
+	fLP         = flag.String("lp", "", "write stats in Influx line-protocol to <file.lp>")
+)
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(),
+			`live_sniffer – live packet dashboard, PCAP dumper + stats exporter
+
+Flags:
+`)
+		flag.PrintDefaults()
+		fmt.Print(`
+Hot-keys while TUI is running:
+  p   pause / resume
+  q   quit        (Ctrl-C also quits)
+`)
+	}
+}
+
+
+
 type packetInfo struct {
-	size  int
-	proto string
-	src   string
-	dst   string
+	size       int
+	proto, src string
+	dst        string
 }
 
 type kv struct{ key string; val uint64 }
 
-type statsSnapshot struct {
+type snapshot struct {
 	pps, bps            uint64
 	tcp, udp, icmp, oth uint64
-	histogram           [4]uint64
-	topSrc, topDst      []kv
+	bin                 [4]uint64
+	srcTop, dstTop      []kv
 }
 
 
@@ -65,15 +78,13 @@ func analyse(pkt gopacket.Packet) (proto, src, dst string) {
 		proto = "TCP"
 	case pkt.Layer(layers.LayerTypeUDP) != nil:
 		proto = "UDP"
-	case pkt.Layer(layers.LayerTypeICMPv4) != nil ||
-		pkt.Layer(layers.LayerTypeICMPv6) != nil:
+	case pkt.Layer(layers.LayerTypeICMPv4) != nil || pkt.Layer(layers.LayerTypeICMPv6) != nil:
 		proto = "ICMP"
 	default:
 		proto = "Other"
 	}
 	if ip4 := pkt.Layer(layers.LayerTypeIPv4); ip4 != nil {
-		h := ip4.(*layers.IPv4)
-		src, dst = h.SrcIP.String(), h.DstIP.String()
+		h := ip4.(*layers.IPv4); src, dst = h.SrcIP.String(), h.DstIP.String()
 	} else if ip6 := pkt.Layer(layers.LayerTypeIPv6); ip6 != nil {
 		h := ip6.(*layers.IPv6); src, dst = h.SrcIP.String(), h.DstIP.String()
 	} else {
@@ -82,248 +93,128 @@ func analyse(pkt gopacket.Packet) (proto, src, dst string) {
 	return
 }
 
+func scale(v, max uint64) int {
+	if v >= max { return 100 }
+	return int(v * 100 / max)
+}
+
 
 
 func main() {
-
-	list      := flag.Bool("list", false, "list interfaces and exit")
-	idx       := flag.Int("n", 0, "index from -list (1-based)")
-	iface     := flag.String("i", "", "exact device string (overrides -n)")
-	filter    := flag.String("f", "", "BPF filter, e.g. 'tcp port 443'")
-	outPC     := flag.String("w", "", "base name for PCAP dump")
-	rotateMB  := flag.Int("rotate-size", 0, "rotate PCAP every N MB (0=off)")
-	outCSV    := flag.String("csv", "", "write stats to <file.csv>")
-	outLP     := flag.String("lp", "", "write stats in LP to <file.lp>")
 	flag.Parse()
-	*filter = expandSimpleFilter(strings.Trim(*filter, "\"'"))
+	*fFilter = expandSimpleFilter(strings.Trim(*fFilter, "\"'"))
 
-	if *list {
-		listIfaces()
-		return
+	if *fList {
+		listIfaces(); return
 	}
 
-	
-	dev := resolveDevice(*iface, *idx)
+	dev := resolveDevice(*fIface, *fIdx)
 	handle, err := pcap.OpenLive(dev, 2000, true, pcap.BlockForever)
-	if err != nil {
-		log.Fatalf("pcap open %s: %v", dev, err)
-	}
+	if err != nil { log.Fatalf("pcap open: %v", err) }
 	defer handle.Close()
 
-	
-	if *filter != "" {
-		if err := handle.SetBPFFilter(*filter); err != nil {
-			log.Fatalf("invalid BPF filter: %v", err)
-		}
-		fmt.Printf("[+] BPF filter applied: %s\n", *filter)
-	}
-
-	
-	rotateBytes := int64(*rotateMB) * 1024 * 1024
-	if *outPC != "" {
-		if rotateBytes > 0 {
-			fmt.Printf("[+] Rotating PCAP every %d MB, base=%s\n", *rotateMB, *outPC)
-		} else {
-			fmt.Printf("[+] Writing PCAP to %s\n", *outPC)
+	if *fFilter != "" {
+		if err := handle.SetBPFFilter(*fFilter); err != nil {
+			log.Fatalf("bad filter: %v", err)
 		}
 	}
 
+	rotateBytes := int64(*fRotateMB) * 1024 * 1024
+
 	
-	var csvWriter *csv.Writer
-	var csvFile *os.File
-	if *outCSV != "" {
-		f, err := os.Create(*outCSV)
-		if err != nil {
-			log.Fatalf("csv create: %v", err)
-		}
-		csvFile = f
-		defer csvFile.Close() 
-		csvWriter = csv.NewWriter(f)
-		csvWriter.Write([]string{"time","pps","bps","tcp","udp","icmp","other"})
-		csvWriter.Flush()
-		fmt.Printf("[+] Writing CSV to %s\n", *outCSV)
+	var csvW *csv.Writer
+	if *fCSV != "" {
+		f, err := os.Create(*fCSV); if err != nil { log.Fatalf("csv: %v", err) }
+		defer f.Close()
+		csvW = csv.NewWriter(f)
+		csvW.Write([]string{"time","pps","bps","tcp","udp","icmp","other"}); csvW.Flush()
 	}
 
 	
-	var lpFile *os.File
-	var lpWriter *bufio.Writer
-	if *outLP != "" {
-		f, err := os.Create(*outLP)
-		if err != nil {
-			log.Fatalf("lp create: %v", err)
-		}
-		lpFile = f
-		defer lpFile.Close() 
-		lpWriter = bufio.NewWriter(f)
-		fmt.Printf("[+] Writing LP to %s\n", *outLP)
+	var lpW *bufio.Writer
+	if *fLP != "" {
+		f, err := os.Create(*fLP); if err != nil { log.Fatalf("lp: %v", err) }
+		defer f.Close()
+		lpW = bufio.NewWriter(f)
 	}
 
 	
-	pktCh := make(chan packetInfo, 4096)
-	statCh := make(chan statsSnapshot, 8)
-	go capture(handle, *outPC, rotateBytes, handle.LinkType(), pktCh)
+	pktCh  := make(chan packetInfo, 4096)
+	statCh := make(chan snapshot, 8)
+	go capture(handle, *fPCAP, rotateBytes, handle.LinkType(), pktCh)
 	go aggregate(pktCh, statCh)
 
 	
-	if err := ui.Init(); err != nil {
-		log.Fatalf("termui init: %v", err)
-	}
+	if err := ui.Init(); err != nil { log.Fatalf("termui: %v", err) }
 	defer ui.Close()
 
-
-	gPPS := widgets.NewGauge()
-	gBPS := widgets.NewGauge()
-	bar  := widgets.NewBarChart()
-	hist := widgets.NewBarChart()
-	srcT := widgets.NewTable()
-	dstT := widgets.NewTable()
-	help := widgets.NewParagraph()
-	help.Text = "[p] pause/resume   |   [q] quit"
-	help.Border = false
-	help.TextStyle = ui.NewStyle(ui.ColorYellow)
-
 	
-	w, h := ui.TerminalDimensions()
-	layout(w, h, gPPS, gBPS, bar, hist, srcT, dstT, help)
-	ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
+	ppsG := widgets.NewGauge(); bpsG := widgets.NewGauge()
+	bar := widgets.NewBarChart(); hist := widgets.NewBarChart()
+	srcT := widgets.NewTable();   dstT := widgets.NewTable()
 
-	
-	uiEvents := make(chan ui.Event, 20)
-	go func() { for e := range ui.PollEvents() { uiEvents <- e } }()
-	heartbeat := time.NewTicker(500 * time.Millisecond)
+	uiEvents := ui.PollEvents()
+	heartbeat := time.NewTicker(500*time.Millisecond)
 	defer heartbeat.Stop()
-
 	paused := false
-	sigCh  := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+
+	resize := func() { w,h:=ui.TerminalDimensions()
+		ppsG.SetRect(0,0,w,3); ppsG.Title="Packets / sec"
+		bpsG.SetRect(0,3,w,6); bpsG.Title="Bytes / sec"
+
+		bar.SetRect(0,6,w,12); bar.Title="Protocol mix"; bar.Labels=[]string{"TCP","UDP","ICMP","Other"}
+		hist.SetRect(0,12,w,16); hist.Title="Size histogram"; hist.Labels=[]string{"<=64B","65–512","513–1500",">1500"}
+		srcT.SetRect(0,16,w/2,h); srcT.Title="Top source"; srcT.Rows=[][]string{{"IP","pps"}}
+		dstT.SetRect(w/2,16,w,h); dstT.Title="Top destination"; dstT.Rows=[][]string{{"IP","pps"}}
+	}
+	resize(); ui.Render(ppsG,bpsG,bar,hist,srcT,dstT)
 
 	for {
 		select {
-		case <-sigCh:
-			return
-
 		case e := <-uiEvents:
 			switch e.ID {
-			case "q","Q","<C-c>":
-				return
-			case "p","P":
-				paused = !paused
-			case "<Resize>":
-				d := e.Payload.(ui.Resize)
-				layout(d.Width, d.Height, gPPS, gBPS, bar, hist, srcT, dstT, help)
-				ui.Clear()
-				ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
+			case "<Resize>": resize(); ui.Clear(); ui.Render(ppsG,bpsG,bar,hist,srcT,dstT)
+			case "p","P":   paused = !paused
+			case "q","Q","<C-c>": return
 			}
 
 		case snap := <-statCh:
-			
-			if csvWriter != nil {
-				csvWriter.Write([]string{
+			// exports
+			if csvW!=nil {
+				csvW.Write([]string{
 					time.Now().UTC().Format(time.RFC3339),
-					strconv.FormatUint(snap.pps,10),
-					strconv.FormatUint(snap.bps,10),
-					strconv.FormatUint(snap.tcp,10),
-					strconv.FormatUint(snap.udp,10),
-					strconv.FormatUint(snap.icmp,10),
-					strconv.FormatUint(snap.oth,10),
-				})
-				csvWriter.Flush()
+					fmt.Sprint(snap.pps), fmt.Sprint(snap.bps),
+					fmt.Sprint(snap.tcp), fmt.Sprint(snap.udp),
+					fmt.Sprint(snap.icmp), fmt.Sprint(snap.oth)}); csvW.Flush()
 			}
-			
-			if lpWriter != nil {
-				ts := time.Now().UTC().UnixNano()
-				lpWriter.WriteString(
-					fmt.Sprintf("live_sniffer pps=%d,bps=%d,tcp=%d,udp=%d,icmp=%d,other=%d %d\n",
-						snap.pps,snap.bps,snap.tcp,snap.udp,snap.icmp,snap.oth,ts))
-				lpWriter.Flush()
+			if lpW!=nil {
+				lpW.WriteString(fmt.Sprintf(
+					"live_sniffer pps=%d,bps=%d,tcp=%d,udp=%d,icmp=%d,other=%d %d\n",
+					snap.pps,snap.bps,snap.tcp,snap.udp,snap.icmp,snap.oth,
+					time.Now().UTC().UnixNano())); lpW.Flush()
 			}
-			if paused {
-				continue
-			}
-			updateWidgets(snap, gPPS, gBPS, bar, hist, srcT, dstT)
-			ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
+			if paused { continue }
+
+			ppsG.Percent=scale(snap.pps,10000); ppsG.Label=fmt.Sprintf("%d pps",snap.pps)
+			kb:=snap.bps/1024; bpsG.Percent=scale(kb,100000); bpsG.Label=fmt.Sprintf("%d KB/s",kb)
+			bar.Data=[]float64{float64(snap.tcp),float64(snap.udp),float64(snap.icmp),float64(snap.oth)}
+			hist.Data=[]float64{float64(snap.bin[0]),float64(snap.bin[1]),float64(snap.bin[2]),float64(snap.bin[3])}
+
+			srcT.Rows = append([][]string{{"IP","pps"}}, kvRows(snap.srcTop)...)
+			dstT.Rows = append([][]string{{"IP","pps"}}, kvRows(snap.dstTop)...)
+			ui.Render(ppsG,bpsG,bar,hist,srcT,dstT)
 
 		case <-heartbeat.C:
-			if !paused {
-				ui.Render(gPPS, gBPS, bar, hist, srcT, dstT, help)
-			}
+			if !paused { ui.Render(ppsG,bpsG,bar,hist,srcT,dstT) }
 		}
 	}
 }
 
 
-
-func layout(
-	w, h int,
-	gPPS, gBPS *widgets.Gauge,
-	bar, hist *widgets.BarChart,
-	srcT, dstT *widgets.Table,
-	help *widgets.Paragraph,
-) {
-	
-	gPPS.SetRect(0, 0, w, 3)
-	gPPS.Title = "Packets / sec"
-	gBPS.SetRect(0, 3, w, 6)
-	gBPS.Title = "Bytes / sec"
-
-	
-	bar.SetRect(0, 6, w, 12)
-	bar.Title  = "Protocol mix (pps)"
-	bar.Labels = []string{"TCP","UDP","ICMP","Other"}
-
-	
-	hist.SetRect(0, 12, w, 16)
-	hist.Title  = "Packet size histogram"
-	hist.Labels = []string{"<=64B","65–512B","513–1500B",">1500B"}
-
-	
-	srcT.SetRect(0, 16, w/2, h-2)
-	srcT.Title = "Top source IPs (pps)"
-	srcT.Rows  = [][]string{{"IP","pps"}}
-
-	dstT.SetRect(w/2, 16, w, h-2)
-	dstT.Title = "Top destination IPs (pps)"
-	dstT.Rows  = [][]string{{"IP","pps"}}
-
-	
-	help.SetRect(0, h-2, w, h)
-}
-
-
-
-func updateWidgets(
-	s statsSnapshot,
-	gPPS, gBPS *widgets.Gauge,
-	bar, hist *widgets.BarChart,
-	srcT, dstT *widgets.Table,
-) {
-	gPPS.Label, gPPS.Percent = fmt.Sprintf("%d pps", s.pps), int(scale(s.pps,10000))
-	kb := s.bps / 1024
-	gBPS.Label, gBPS.Percent = fmt.Sprintf("%d KB/s", kb), int(scale(kb,100000))
-
-	bar.Data = []float64{
-		float64(s.tcp), float64(s.udp),
-		float64(s.icmp), float64(s.oth),
-	}
-
-	hist.Data = []float64{
-		float64(s.histogram[0]),
-		float64(s.histogram[1]),
-		float64(s.histogram[2]),
-		float64(s.histogram[3]),
-	}
-
-	srcRows := [][]string{{"IP","pps"}}
-	for _, kv := range s.topSrc {
-		srcRows = append(srcRows, []string{kv.key, fmt.Sprintf("%d", kv.val)})
-	}
-	srcT.Rows = srcRows
-
-	dstRows := [][]string{{"IP","pps"}}
-	for _, kv := range s.topDst {
-		dstRows = append(dstRows, []string{kv.key, fmt.Sprintf("%d", kv.val)})
-	}
-	dstT.Rows = dstRows
+func kvRows(arr []kv) [][]string {
+	rows := make([][]string, len(arr))
+	for i, kv := range arr { rows[i]=[]string{kv.key,strconv.FormatUint(kv.val,10)} }
+	return rows
 }
 
 
@@ -343,7 +234,8 @@ func capture(
 		if rotateBytes > 0 {
 			ext := filepath.Ext(outPC)
 			base := strings.TrimSuffix(outPC, ext)
-			name = fmt.Sprintf("%s_%s%s", base, time.Now().Format("20060102_150405"), ext)
+			ts := time.Now().Format("20060102_150405")
+			name = fmt.Sprintf("%s_%s%s", base, ts, ext)
 		}
 		var err error
 		f, err = os.Create(name)
@@ -372,6 +264,7 @@ func capture(
 		proto, s, d := analyse(pkt)
 		out <- packetInfo{len(pkt.Data()), proto, s, d}
 	}
+
 	if f != nil {
 		f.Close()
 	}
@@ -379,7 +272,8 @@ func capture(
 
 
 
-func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
+
+func aggregate(in <-chan packetInfo, out chan<- snapshot) {
 	var pps, bps, tcp, udp, icmp, oth uint64
 	bins := [4]uint64{}
 	srcMap := make(map[string]uint64)
@@ -389,13 +283,19 @@ func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
 	for {
 		select {
 		case p := <-in:
-			pps++; bps += uint64(p.size)
+			pps++
+			bps += uint64(p.size)
 			switch p.proto {
-			case "TCP": tcp++
-			case "UDP": udp++
-			case "ICMP": icmp++
-			default: oth++
+			case "TCP":
+				tcp++
+			case "UDP":
+				udp++
+			case "ICMP":
+				icmp++
+			default:
+				oth++
 			}
+			
 			switch {
 			case p.size <= 64:
 				bins[0]++
@@ -410,12 +310,13 @@ func aggregate(in <-chan packetInfo, out chan<- statsSnapshot) {
 			dstMap[p.dst]++
 
 		case <-tick.C:
-			out <- statsSnapshot{
+			out <- snapshot{
 				pps, bps, tcp, udp, icmp, oth,
 				bins,
 				topN(srcMap, 5),
 				topN(dstMap, 5),
 			}
+			// reset counters
 			pps, bps, tcp, udp, icmp, oth = 0, 0, 0, 0, 0, 0
 			bins = [4]uint64{}
 			srcMap = make(map[string]uint64)
@@ -456,13 +357,6 @@ func resolveDevice(custom string, idx int) string {
 	return devs[0].Name
 }
 
-func scale(val, max uint64) uint64 {
-	if val >= max {
-		return 100
-	}
-	return val * 100 / max
-}
-
 func expandSimpleFilter(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "icmp":
@@ -475,6 +369,7 @@ func expandSimpleFilter(s string) string {
 		return s
 	}
 }
+
 
 func topN(m map[string]uint64, n int) []kv {
 	arr := make([]kv, 0, len(m))
